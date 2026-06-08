@@ -8,6 +8,8 @@ import serial
 import numpy as np
 import time
 from datetime import datetime
+import datetime as _dt
+import pytz
 import collections
 import os
 import threading
@@ -17,12 +19,12 @@ from flask import Flask, Response, render_template_string
 
 
 # --- Configuration ---
-VERSION = "1.015  2026-06-07"  # bold event label/time, SS.S timestamp, 4s baseline
+VERSION = "1.035  2026-06-08"  # fix click by not rebuilding table on every SSE tick
 OUTPUT_DIR    = 'events'
 
 WEB_PORT      = 8080         # LAN web interface port
-WEB_HZ        = 5           # SSE update rate for browser clients
-WEB_BUF_SECS  = 50          # seconds of history kept for web display (10s shown)
+WEB_HZ        = 2            # SSE update rate for browser clients
+WEB_BUF_SECS  = 50           # seconds of history kept for web display (10s shown)
 
 SAMPLE_RATE   = 100          # nominal samples/sec
 BASELINE_SECS = 4            # seconds of quiet data to seed the baseline
@@ -42,6 +44,7 @@ EMA_ALPHA     = 0.001        # EMA coefficient for slow baseline drift (~1000-sa
 # at 10%–90% of max excursion.  Pedestrians ~0.7–0.8; vehicles ~0.05.
 RISE_TIME_THRESHOLD = 0.35  # >= this → pedestrian, < this → vehicle
 DROPOUT_VALUES = {0, 45000} # mm: 0=overload, 45000=loss-of-signal
+STABLE_RATE_THRESHOLD = 100 # mm/sample: max backward diff for a point to be "stable"
 
 def find_ch341_port():
     """Return the serial port path for the first CH341 USB-serial adapter found."""
@@ -74,7 +77,12 @@ _web_state  = {                        # latest single-sample snapshot
     "last_event_id": 0.0,              # epoch of most recent completed event
 }
 # Most recent completed event — stored once, fetched on demand by browser
-_last_event = None   # dict: {id, category, bg_mean, samples: [[offset_ms, dist], ...]}
+_last_event    = None   # dict: {id, category, bg_mean, samples: [[offset_ms, dist], ...]}
+_recent_events = collections.deque(maxlen=10) # last 10 full events for selection/overlay
+_event_log  = collections.deque(maxlen=10)  # last 10 event summaries for SSE
+# All event epochs for the current calendar day — used for hourly/daily counts.
+# A deque with a generous cap; at one event/sec for 24 h that's 86400 entries.
+_event_epochs = collections.deque(maxlen=100000)
 
 def _web_push(t, dist, strength, temp_c, in_ev):
     """Called from main loop after every sample read."""
@@ -121,12 +129,12 @@ _PAGE_HTML = r"""<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: var(--mono);
          display: flex; flex-direction: column; align-items: center;
-         min-height: 100vh; padding: 1.2rem 1rem 2rem; }
+         min-height: 100vh; padding: .6rem 1rem 2rem; }
 
   /* ── header row ── */
   #header { width: 100%; max-width: 760px; display: flex;
             align-items: baseline; justify-content: space-between;
-            margin-bottom: 1.2rem; }
+            margin-bottom: .5rem; }
   #title  { font-family: var(--head); font-size: 1.05rem; letter-spacing: .22em;
             color: var(--accent); text-transform: uppercase; }
   #clock  { font-family: var(--mono); font-size: 1.05rem; color: var(--dim);
@@ -140,17 +148,37 @@ _PAGE_HTML = r"""<!DOCTYPE html>
     50%,100% { background: var(--bord); box-shadow: none; }
   }
 
-  /* ── distance readout ── */
-  #readout { font-family: var(--mono); font-size: clamp(3rem,14vw,5.5rem);
-             color: var(--accent); transition: color .15s;
-             display: flex; align-items: baseline; gap: 0; }
-  #readout.ev { color: var(--warn); }
-  .rdig { display: inline-block; width: .62em; text-align: center; }
-  .rsep { display: inline-block; width: .28em; text-align: center; }
-  #r-unit { font-size: .38em; color: var(--dim); margin-left: .5rem;
-            font-family: var(--mono); align-self: flex-end; padding-bottom: .25em; }
-  #sub { font-size: .85rem; color: var(--dim); margin-top: .25rem; min-height: 1.2em;
+  /* ── compact distance readout bar ── */
+  #readout-bar { display: flex; align-items: baseline; gap: .3rem;
+                 margin-top: .4rem; margin-bottom: 0; flex-wrap: wrap; }
+  .rdlabel { font-size: .78rem; color: var(--dim); }
+  .rdval   { font-family: var(--mono); font-size: 1.15rem; color: var(--accent);
+             font-weight: bold; min-width: 5em; }
+  .rdval.ev { color: var(--warn); }
+  #sub { font-size: .85rem; color: var(--dim); margin-top: .1rem; min-height: 1em;
          text-align: center; font-weight: bold; }
+
+  /* ── stats bar (counts + version) ── */
+  #stats-bar { width: 100%; max-width: 760px; margin-top: .9rem;
+               display: flex; justify-content: space-between; align-items: baseline;
+               font-size: .78rem; color: var(--dim); }
+  #stats-bar b { color: var(--text); font-weight: bold; }
+  #version-str { font-size: .68rem; color: #a0b0b8; font-style: italic; }
+
+  /* ── event log table ── */
+  #event-log { width: 100%; max-width: 760px; margin-top: 1.2rem;
+               border-collapse: collapse; font-size: .78rem; }
+  #event-log th { text-align: left; color: var(--dim); font-weight: normal;
+                  letter-spacing: .06em; border-bottom: 1px solid var(--bord);
+                  padding: .25rem .4rem; }
+  #event-log td { padding: .22rem .4rem; border-bottom: 1px solid #e4e8ec;
+                  font-family: var(--mono); }
+  #event-log tr:first-child td { font-weight: bold; color: var(--text); }
+  #event-log .cat-v { color: #0068a8; }
+  #event-log .cat-p { color: #1a7a30; }
+  #event-log tbody tr { background: var(--panel); cursor: pointer; }
+  #event-log tbody tr:hover td { background: #eef4fb; }
+  #event-log tbody tr.selected td { background: #ddeeff; font-weight: bold; }
 
   /* ── canvas panels ── */
   .chart-panel { width: 100%; max-width: 760px; margin-top: 1.4rem;
@@ -175,14 +203,11 @@ _PAGE_HTML = r"""<!DOCTYPE html>
   <div id="clock">--:--:--</div>
 </div>
 
-<!-- mm.mm: 2 integer digits + dot + 2 fractional digits -->
-<div id="readout">
-  <span class="rdig" id="r0">-</span>
-  <span class="rdig" id="r1">-</span>
-  <span class="rsep">.</span>
-  <span class="rdig" id="r2">-</span>
-  <span class="rdig" id="r3">-</span>
-  <span id="r-unit">m</span>
+<div id="readout-bar">
+  <span class="rdlabel">now:</span>
+  <span id="readout-live" class="rdval">--.-- m</span>
+  <span class="rdlabel" style="margin-left:1.4rem">last event:</span>
+  <span id="readout-event" class="rdval">-- m</span>
 </div>
 <div id="sub">&nbsp;</div>
 
@@ -192,7 +217,13 @@ _PAGE_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div class="chart-panel">
-  <div class="chart-label"><b>Last event</b><span id="lbl-event">— none yet —</span></div>
+  <div class="chart-label" style="display:flex;align-items:baseline;justify-content:space-between;">
+    <span><b>Last event</b><span id="lbl-event">— none yet —</span></span>
+    <button id="btn-overlay" onclick="toggleOverlay()"
+      style="font-size:.68rem;font-family:var(--mono);padding:.15rem .5rem;
+             border:1px solid var(--bord);border-radius:3px;background:var(--panel);
+             color:var(--dim);cursor:pointer;">overlay 5</button>
+  </div>
   <canvas id="chart-event"></canvas>
 </div>
 
@@ -204,6 +235,24 @@ _PAGE_HTML = r"""<!DOCTYPE html>
   <span>temp: <b id="m-temp">–</b> °C</span>
 </div>
 
+<table id="event-log">
+  <thead><tr>
+    <th>Time</th>
+    <th>Dist (m)</th>
+    <th>Dist RMS</th>
+    <th>Category</th>
+    <th>Dur (ms)</th>
+    <th>Str avg</th>
+    <th>Str RMS</th>
+  </tr></thead>
+  <tbody id="log-body"><tr><td colspan="7" style="color:var(--dim)">— no events yet —</td></tr></tbody>
+</table>
+
+<div id="stats-bar">
+  <span>Last 60 min: <b id="cnt-60">–</b> &nbsp; Today: <b id="cnt-day">–</b></span>
+  <span id="version-str">v<!--VER--></span>
+</div>
+
 <script>
 // ── constants ────────────────────────────────────────────────────────────────
 const WIN_S   = 10;
@@ -211,10 +260,50 @@ const MAX_PTS = 1000;
 const MARGIN  = { l: 58, r: 8, t: 6, b: 28 };   // l wider for "MM.mmm m" labels
 
 // ── state ────────────────────────────────────────────────────────────────────
-const pts      = [];          // live history: {t, d, ev}
-let   bgMean   = 0, bgTrig = 0;
-let   evData   = null;        // last event: {id, category, bg_mean, samples}
-let   lastEvId = 0;
+const pts        = [];        // live history: {t, d, ev}
+let   bgMean     = 0, bgTrig = 0;
+let   evData        = null;   // currently displayed event (selected or latest)
+let   evDataList    = [];     // last 10 full events (newest last)
+let   lastEvId      = 0;
+let   overlayOn     = false;
+let   selectedEvIdx = null;   // index into evDataList of selected row (null = latest)
+
+function toggleOverlay() {
+  overlayOn = !overlayOn;
+  document.getElementById('btn-overlay').style.fontWeight = overlayOn ? 'bold' : 'normal';
+  document.getElementById('btn-overlay').style.color = overlayOn ? 'var(--accent)' : 'var(--dim)';
+  drawEvent();
+}
+
+function selectEventRow(listIdx) {
+  if (listIdx < 0 || listIdx >= evDataList.length) return;
+  selectedEvIdx = listIdx;
+  evData = evDataList[listIdx];
+  updateChartLabel(evData);
+  setLastEventReadout(evData.object_range_mm);
+  highlightRow(listIdx);
+  drawEvent();
+}
+
+function highlightRow(listIdx) {
+  const tbody   = document.getElementById('log-body');
+  const rows    = tbody.querySelectorAll('tr');
+  const lastIdx = evDataList.length - 1;
+  rows.forEach((tr, rowPos) => {
+    tr.classList.toggle('selected', (lastIdx - rowPos) === listIdx);
+  });
+}
+
+function updateChartLabel(ev) {
+  const t   = new Date(ev.id * 1000);
+  const hms = t.toTimeString().slice(0, 8);
+  const ms  = t.getMilliseconds();
+  const ts  = hms + '.' + Math.floor(ms / 100);
+  document.getElementById('lbl-event').innerHTML =
+    '&nbsp;&nbsp;<b>' + ts + '</b> · ' + (ev.category || '?') +
+    ' · ' + ev.duration_ms + ' ms' +
+    ' · <b style="color:#1a2530;font-weight:bold">' + (ev.object_range_mm / 1000).toFixed(3) + ' m</b>';
+}
 
 // ── canvas setup ─────────────────────────────────────────────────────────────
 const cLive  = document.getElementById('chart-live');
@@ -412,43 +501,116 @@ function drawLive() {
   xLive.textAlign = 'center'; xLive.textBaseline = 'middle';
   xLive.translate(10, mt + ph / 2);
   xLive.rotate(-Math.PI / 2);
-  xLive.fillText('m', 0, 0);
+  xLive.fillText('meters', 0, 0);
   xLive.restore();
 }
 
 // ── event chart ──────────────────────────────────────────────────────────────
+// ── event chart ──────────────────────────────────────────────────────────────
+// Overlay colour palette: index 0 = newest/most prominent
+const OVERLAY_DIST_COLORS = ['#c05000','#b06828','#a07840','#908858','#809870'];
+const OVERLAY_STR_COLORS  = ['rgba(26,122,48,0.55)','rgba(26,122,48,0.38)',
+                              'rgba(26,122,48,0.28)','rgba(26,122,48,0.20)',
+                              'rgba(26,122,48,0.14)'];
+
+// Draw one event's strength + distance traces onto xEvent.
+// toSec(offset_ms, ev) returns the X value (% of dur window).
+function drawEventTrace(ev, toSec, tx, ty, sy, distColor, strColor) {
+  const samps    = ev.samples;
+  const validSet = new Set(ev.valid_indices || []);
+
+  // Strength trace (drawn first so distance sits on top)
+  xEvent.save();
+  xEvent.strokeStyle = strColor;
+  xEvent.lineWidth   = 1.0;
+  xEvent.beginPath();
+  let strPenDown = false;
+  samps.forEach(s => {
+    const t = toSec(s[0], ev), sv = s[2];
+    const x = tx(t), y = sy(sv);
+    if (y === null) {
+      if (strPenDown) { xEvent.stroke(); xEvent.beginPath(); strPenDown = false; }
+    } else {
+      if (!strPenDown) { xEvent.moveTo(x, y); strPenDown = true; }
+      else               xEvent.lineTo(x, y);
+    }
+  });
+  if (strPenDown) xEvent.stroke();
+  xEvent.restore();
+
+  // Distance trace: thin (1px) outside valid region, thick (3px) inside
+  xEvent.save();
+  xEvent.strokeStyle = distColor;
+  let penDown = false, lastWasValid = null;
+  function flushPath() { if (penDown) { xEvent.stroke(); xEvent.beginPath(); penDown = false; } }
+  samps.forEach((s, idx) => {
+    const t = toSec(s[0], ev), d = s[1];
+    const x = tx(t);
+    const isValid = validSet.has(idx);
+    if (isSentinel(d)) {
+      flushPath(); lastWasValid = null;
+    } else {
+      const y = ty(d);
+      if (lastWasValid !== null && isValid !== lastWasValid) flushPath();
+      if (!penDown) {
+        xEvent.lineWidth = isValid ? 3.0 : 1.0;
+        xEvent.beginPath(); xEvent.moveTo(x, y); penDown = true;
+      } else { xEvent.lineTo(x, y); }
+      lastWasValid = isValid;
+    }
+  });
+  flushPath();
+  xEvent.restore();
+}
+
 function drawEvent() {
   const W = cEvent.offsetWidth, H = cEvent.offsetHeight;
   xEvent.clearRect(0, 0, W, H);
   if (!evData || !evData.samples.length) return;
 
-  const samps  = evData.samples;            // [[offset_ms, dist, strength], ...]
-  const trigMs = evData.trigger_ms || 0;
-  const allD   = samps.map(s => s[1]).filter(d => !isSentinel(d));
+  const baseIdx  = (selectedEvIdx !== null) ? selectedEvIdx : evDataList.length - 1;
+  let   drawList;
+  if (overlayOn && evDataList.length > 1) {
+    const lo = Math.max(0, baseIdx - 4);
+    drawList = evDataList.slice(lo, baseIdx + 1);
+  } else {
+    drawList = evData ? [evData] : [];
+  }
+  if (drawList.length === 0) return;
+
+  // toSec: converts offset_ms to % of that event's dur window
+  // 0% = dur_start_ms, 100% = dur_start_ms + duration_ms
+  const toSec = (ms, ev) => (ms - (ev.dur_start_ms || 0)) / Math.max(ev.duration_ms || 1, 1) * 100;
+
+  // Fixed X axis: -20% to +120%
+  const tMin = -20, tMax = 120;
+
+  // Compute Y axis ranges using only samples within the visible X window
+  let allD = [], allS = [];
+  drawList.forEach(ev => {
+    ev.samples.forEach(s => {
+      const pct = toSec(s[0], ev);
+      if (pct < tMin || pct > tMax) return;   // outside visible window
+      if (!isSentinel(s[1])) allD.push(s[1]);
+      if (s[2] > 0)          allS.push(s[2]);
+    });
+  });
   if (allD.length === 0) return;
-  const evBg   = evData.bg_mean;
-  const dMin   = Math.min(...allD) - 30;
-  const dMax   = Math.max(...allD, evBg) + 30;
-  const dRange = dMax - dMin || 1;
 
-  // Strength axis — use all samples (sentinels may have odd strength, include anyway)
-  const allS  = samps.map(s => s[2] || 0);
-  const sMin  = Math.max(0, Math.min(...allS) * 0.95);
-  const sMax  = Math.max(...allS) * 1.05 + 1;
-  const sRange = sMax - sMin || 1;
+  const evBg      = evData.bg_mean;
+  const dMax      = Math.max(...allD, evBg) + 30;
+  const dMin      = Math.min(...allD) - Math.max(30, (dMax - Math.min(...allD)) * 0.05);
+  const dRange    = dMax - dMin || 1;
+  const sLogMin   = Math.log10(Math.max(1, Math.min(...allS) * 0.9));
+  const sLogMax   = Math.log10(Math.max(...allS) * 1.1 + 1);
+  const sLogRange = sLogMax - sLogMin || 1;
 
-  // t=0 at trigger crossing
-  const toSec = ms => (ms - trigMs) / 1000;
-  const tMin  = toSec(samps[0][0]);
-  const tMax  = toSec(samps[samps.length - 1][0]);
-
-  // Use wider right margin to fit strength axis labels
   const ml = MARGIN.l, mr = 52, mt = MARGIN.t, mb = MARGIN.b;
   const pw = W - ml - mr, ph = H - mt - mb;
   const tRange = tMax - tMin || 1;
   const tx = t  => ml + (t - tMin) / tRange * pw;
   const ty = d  => mt + ph - (d - dMin) / dRange * ph;
-  const sy = sv => mt + ph - (sv - sMin) / sRange * ph;
+  const sy = sv => (sv > 0) ? mt + ph - (Math.log10(sv) - sLogMin) / sLogRange * ph : null;
 
   // ── grid ──
   xEvent.font        = FONT_SM;
@@ -456,7 +618,7 @@ function drawEvent() {
   xEvent.strokeStyle = COL_GRID;
   xEvent.lineWidth   = 1;
 
-  // Left Y-axis: distance in metres
+  // Left Y-axis: distance in integer metres
   const rawStep = (dMax - dMin) / 5;
   const mag     = Math.pow(10, Math.floor(Math.log10(rawStep)));
   const yStep   = Math.ceil(rawStep / mag) * mag;
@@ -465,110 +627,82 @@ function drawEvent() {
     const y = ty(d);
     xEvent.beginPath(); xEvent.moveTo(ml, y); xEvent.lineTo(W - mr, y); xEvent.stroke();
     xEvent.textAlign = 'right'; xEvent.textBaseline = 'middle';
-    xEvent.fillText((d / 1000).toFixed(3), ml - 4, y);
+    xEvent.fillText(Math.round(d / 1000), ml - 4, y);
   }
 
-  // X-axis: 200 ms ticks
-  const TICK_S    = 0.200;
-  const firstTick = Math.ceil(tMin / TICK_S) * TICK_S;
-  for (let t = firstTick; t <= tMax + 1e-9; t += TICK_S) {
+  // X-axis: ticks every 20%
+  const TICK_PCT  = 20;
+  const firstTick = Math.ceil(tMin / TICK_PCT) * TICK_PCT;
+  for (let t = firstTick; t <= tMax + 1e-9; t += TICK_PCT) {
     const x = tx(t);
     xEvent.beginPath(); xEvent.moveTo(x, mt); xEvent.lineTo(x, mt + ph); xEvent.stroke();
     xEvent.textAlign = 'center'; xEvent.textBaseline = 'top';
-    xEvent.fillText(t.toFixed(1) + 's', x, mt + ph + 4);
+    xEvent.fillText(Math.round(t) + '%', x, mt + ph + 4);
   }
 
-  // Right Y-axis: strength labels (no grid lines — left axis already drew them)
-  const sRawStep = sRange / 5;
-  const sMag     = Math.pow(10, Math.floor(Math.log10(Math.max(sRawStep, 1))));
-  const ssStep   = Math.ceil(sRawStep / sMag) * sMag || 1;
-  const ssFirst  = Math.ceil(sMin / ssStep) * ssStep;
+  // Right Y-axis: strength log labels
   xEvent.fillStyle = '#1a7a30';
-  for (let sv = ssFirst; sv <= sMax; sv += ssStep) {
-    const y = sy(sv);
-    xEvent.textAlign = 'left'; xEvent.textBaseline = 'middle';
-    xEvent.fillText(Math.round(sv), W - mr + 4, y);
+  const sDecMin = Math.floor(sLogMin), sDecMax = Math.ceil(sLogMax);
+  const logTicks = [];
+  for (let dec = sDecMin; dec <= sDecMax; dec++) {
+    [1, 2, 5].forEach(m => {
+      const v = m * Math.pow(10, dec);
+      if (v >= Math.pow(10, sLogMin) * 0.99 && v <= Math.pow(10, sLogMax) * 1.01) logTicks.push(v);
+    });
   }
+  logTicks.forEach(sv => {
+    const y = sy(sv);
+    if (y === null || y < mt || y > mt + ph) return;
+    xEvent.textAlign = 'left'; xEvent.textBaseline = 'middle';
+    xEvent.fillText(sv >= 1000 ? (sv/1000).toFixed(0)+'k' : Math.round(sv), W - mr + 4, y);
+    xEvent.strokeStyle = '#1a7a30'; xEvent.lineWidth = 1;
+    xEvent.beginPath(); xEvent.moveTo(W - mr, y); xEvent.lineTo(W - mr + 4, y); xEvent.stroke();
+  });
 
-  // Axis border
   xEvent.strokeStyle = COL_AXIS;
   xEvent.strokeRect(ml, mt, pw, ph);
 
-  // Baseline dashed line
+  // Baseline + object range reference lines (most recent event)
   drawDashedHLine(xEvent, ty(evBg), W - mr + MARGIN.r, '#8090a0');
+  if (evData.object_range_mm)
+    drawDashedHLine(xEvent, ty(evData.object_range_mm), W - mr + MARGIN.r, '#a0a0a0');
 
-  // t=0 trigger line
+  // 0% and 100% event boundary lines
   xEvent.save();
-  xEvent.strokeStyle = '#4080c0'; xEvent.lineWidth = 1.5;
-  xEvent.beginPath(); xEvent.moveTo(tx(0), mt); xEvent.lineTo(tx(0), mt + ph);
-  xEvent.stroke(); xEvent.restore();
-
-  // ── strength trace (dotted, secondary, drawn first so distance is on top) ──
-  const strPts = samps.map(s => [toSec(s[0]), s[2] || 0]);
-  xEvent.save();
-  xEvent.strokeStyle = '#1a7a30';
-  xEvent.lineWidth   = 1.5;
-  xEvent.setLineDash([3, 4]);
-  xEvent.beginPath();
-  strPts.forEach(([t, sv], i) => {
-    const x = tx(t), y = sy(sv);
-    i === 0 ? xEvent.moveTo(x, y) : xEvent.lineTo(x, y);
+  xEvent.strokeStyle = '#b0b8c0'; xEvent.lineWidth = 1; xEvent.setLineDash([3, 3]);
+  [0, 100].forEach(pct => {
+    const x = tx(pct);
+    xEvent.beginPath(); xEvent.moveTo(x, mt); xEvent.lineTo(x, mt + ph); xEvent.stroke();
   });
-  xEvent.stroke();
-  xEvent.setLineDash([]);
+  xEvent.setLineDash([]); xEvent.restore();
+
+  // Draw traces oldest-first so newest is on top, clipped to plot area
+  xEvent.save();
+  xEvent.beginPath();
+  xEvent.rect(ml, mt, pw, ph);
+  xEvent.clip();
+  const n = drawList.length;
+  for (let i = 0; i < n; i++) {
+    const ci = (n - 1) - i;
+    drawEventTrace(drawList[i], toSec, tx, ty, sy,
+                   OVERLAY_DIST_COLORS[Math.min(ci, OVERLAY_DIST_COLORS.length - 1)],
+                   OVERLAY_STR_COLORS [Math.min(ci, OVERLAY_STR_COLORS.length  - 1)]);
+  }
   xEvent.restore();
 
-  // ── distance trace (bold, primary, on top) ──
-  const pts2d = samps.map(s => [toSec(s[0]), s[1]]);
-  // plotLine uses MARGIN.r for clipping — pass adjusted W so it uses our mr
-  // Instead draw directly with the same sentinel logic:
-  xEvent.save();
-  xEvent.lineWidth   = 2.5;
-  xEvent.strokeStyle = '#c05000';
-  let penDown = false, lastValidY = null;
-  const markers = [];
-  xEvent.beginPath();
-  pts2d.forEach(([t, d]) => {
-    const x = tx(t);
-    if (isSentinel(d)) {
-      if (penDown) xEvent.stroke();
-      penDown = false; xEvent.beginPath();
-      if (lastValidY !== null) markers.push({x, y: lastValidY});
-    } else {
-      const y = ty(d);
-      if (!penDown) { xEvent.moveTo(x, y); penDown = true; }
-      else            xEvent.lineTo(x, y);
-      lastValidY = y;
-    }
-  });
-  if (penDown) xEvent.stroke();
-  // × markers
-  const R = 4;
-  xEvent.strokeStyle = '#cc4400'; xEvent.lineWidth = 1.5;
-  markers.forEach(({x, y}) => {
-    xEvent.beginPath();
-    xEvent.moveTo(x-R,y-R); xEvent.lineTo(x+R,y+R);
-    xEvent.moveTo(x+R,y-R); xEvent.lineTo(x-R,y+R);
-    xEvent.stroke();
-  });
-  xEvent.restore();
-
-  // Left Y-axis label (distance)
+  // Axis labels
   xEvent.save();
   xEvent.font = FONT_SM; xEvent.fillStyle = COL_TEXT;
   xEvent.textAlign = 'center'; xEvent.textBaseline = 'middle';
-  xEvent.translate(10, mt + ph / 2);
-  xEvent.rotate(-Math.PI / 2);
-  xEvent.fillText('m', 0, 0);
+  xEvent.translate(10, mt + ph / 2); xEvent.rotate(-Math.PI / 2);
+  xEvent.fillText('meters', 0, 0);
   xEvent.restore();
 
-  // Right Y-axis label (strength)
   xEvent.save();
   xEvent.font = FONT_SM; xEvent.fillStyle = '#1a7a30';
   xEvent.textAlign = 'center'; xEvent.textBaseline = 'middle';
-  xEvent.translate(W - 10, mt + ph / 2);
-  xEvent.rotate(Math.PI / 2);
-  xEvent.fillText('strength', 0, 0);
+  xEvent.translate(W - 10, mt + ph / 2); xEvent.rotate(Math.PI / 2);
+  xEvent.fillText('signal level', 0, 0);
   xEvent.restore();
 }
 
@@ -586,19 +720,14 @@ function updateClock() {
 updateClock();
 setInterval(updateClock, 1000);
 
-// ── distance readout (mm.mm fixed-width digits) ───────────────────────────────
+// ── distance readout ─────────────────────────────────────────────────────────
 function setReadout(dist_mm, isEv) {
-  // Clamp to 0–99990 mm, display as mm.mm metres (2 integer, 2 fractional)
-  const m      = Math.max(0, Math.min(99990, Math.round(dist_mm)));
-  const meters = m / 1000;
-  // padStart(5) gives "03.46" for 3456 mm, "40.00" for 40000 mm
-  const str = meters.toFixed(2).padStart(5, '0');
-  document.getElementById('r0').textContent = str[0];
-  document.getElementById('r1').textContent = str[1];
-  // str[2] is the dot — skip
-  document.getElementById('r2').textContent = str[3];
-  document.getElementById('r3').textContent = str[4];
-  document.getElementById('readout').className = isEv ? 'ev' : '';
+  const el = document.getElementById('readout-live');
+  el.textContent = (dist_mm / 1000).toFixed(2) + ' m';
+  el.className = 'rdval' + (isEv ? ' ev' : '');
+}
+function setLastEventReadout(range_mm) {
+  document.getElementById('readout-event').textContent = (range_mm / 1000).toFixed(3) + ' m';
 }
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
@@ -630,33 +759,87 @@ src.onmessage = e => {
   // Check for new completed event
   if (msg.last_event_id && msg.last_event_id !== lastEvId) {
     lastEvId = msg.last_event_id;
-    fetch('/event')
+    fetch('/events')
       .then(r => r.json())
-      .then(data => {
-        evData = data;
-        const t  = new Date(data.id * 1000);
-        const hms = t.toTimeString().slice(0, 8);
-        const ms  = t.getMilliseconds();
-        const ts  = hms + '.' + Math.floor(ms / 100);
-        document.getElementById('lbl-event').innerHTML =
-          '<b>' + ts + '</b> · ' + (data.category || '?') +
-          ' · ' + data.duration_ms + ' ms' +
-          ' · <b style="color:#1a2530;font-weight:bold">' + (data.object_range_mm / 1000).toFixed(3) + ' m</b>';
+      .then(list => {
+        evDataList = list;
+        if (selectedEvIdx === null || selectedEvIdx === evDataList.length - 2) {
+          selectedEvIdx = null;
+          evData = list.length ? list[list.length - 1] : null;
+        }
+        if (evData) {
+          updateChartLabel(evData);
+          setLastEventReadout(evData.object_range_mm);
+        }
+        rebuildTable(msg.event_log);
         drawEvent();
       });
   }
+
+  // Event counts
+  if (msg.count_60min !== undefined)
+    document.getElementById('cnt-60').textContent  = msg.count_60min;
+  if (msg.count_today !== undefined)
+    document.getElementById('cnt-day').textContent = msg.count_today;
+
+  // Table only rebuilt when a new event arrives (handled above); no-op here.
 
   dot.className = 'live';   // CSS @keyframes handles 1 Hz blink; set once, stays
 };
 
 src.onerror = () => { dot.className = ''; };
+
+// ── table rendering ───────────────────────────────────────────────────────────
+function rebuildTable(eventLog) {
+  if (!eventLog || !eventLog.length) return;
+  const rows    = eventLog.slice().reverse();
+  const tbody   = document.getElementById('log-body');
+  const lastIdx = evDataList.length - 1;
+  tbody.innerHTML = rows.map((ev, rowPos) => {
+    const evIdx   = lastIdx - rowPos;
+    const dt      = new Date(ev.epoch * 1000);
+    const hms     = dt.toTimeString().slice(0, 8);
+    const s1      = Math.floor(dt.getMilliseconds() / 100);
+    const ts      = hms + '.' + s1;
+    const distM   = (ev.range_mm / 1000).toFixed(2);
+    const cat     = ev.category || '?';
+    const catCls  = cat === 'vehicle' ? 'cat-v' : 'cat-p';
+    const distRms = ev.range_rms !== undefined ? (ev.range_rms / 1000).toFixed(3) : '–';
+    const selIdx  = (selectedEvIdx !== null) ? selectedEvIdx : lastIdx;
+    const selCls  = (evIdx === selIdx && evIdx >= 0) ? ' selected' : '';
+    const onclick = evIdx >= 0 ? `onclick="selectEventRow(${evIdx})"` : '';
+    return `<tr class="${selCls}" ${onclick}>
+      <td>${ts}</td>
+      <td>${distM}</td>
+      <td>${distRms}</td>
+      <td class="${catCls}">${cat}</td>
+      <td>${ev.duration_ms}</td>
+      <td>${ev.str_avg}</td>
+      <td>${ev.str_rms}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── keyboard navigation ───────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (!evDataList.length) return;
+  const curIdx = (selectedEvIdx !== null) ? selectedEvIdx : evDataList.length - 1;
+  if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+    e.preventDefault();
+    selectEventRow(Math.min(curIdx + 1, evDataList.length - 1));
+  } else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+    e.preventDefault();
+    selectEventRow(Math.max(curIdx - 1, 0));
+  }
+});
 </script>
 </body>
 </html>"""
 
 @_flask_app.route('/')
 def _index():
-    return Response(_PAGE_HTML, mimetype='text/html')
+    page = _PAGE_HTML.replace('<!--VER-->', VERSION)
+    return Response(page, mimetype='text/html')
 
 @_flask_app.route('/event')
 def _event():
@@ -665,6 +848,12 @@ def _event():
     if ev is None:
         return Response('{}', mimetype='application/json')
     return Response(json.dumps(ev), mimetype='application/json')
+
+@_flask_app.route('/events')
+def _events():
+    with _web_lock:
+        evs = list(_recent_events)
+    return Response(json.dumps(evs), mimetype='application/json')
 
 @_flask_app.route('/stream')
 def _stream():
@@ -710,6 +899,15 @@ def _stream():
                         t_bucket = t_next
                 snap['dist_avg'] = round(last_bucket_mean) if last_bucket_mean is not None \
                                    else snap.get('dist', 0)
+                snap['event_log'] = list(_event_log)
+                # Counts computed fresh each tick so midnight rollover is handled
+                now_t = time.time()
+                midnight = _dt.datetime.combine(
+                    _dt.date.today(), _dt.time.min).timestamp()
+                snap['count_60min'] = sum(1 for e in _event_epochs
+                                          if now_t - e <= 3600)
+                snap['count_today'] = sum(1 for e in _event_epochs
+                                          if e >= midnight)
             snap['history'] = history
             payload = json.dumps(snap)
             yield f"data: {payload}\n\n"
@@ -761,13 +959,33 @@ def read_sample():
 
 # ---------------------------------------------------------------------------
 # Phase 1: seed baseline from BASELINE_SECS seconds of quiet readings
+# Restarts if any sample deviates more than BASELINE_MAX_RANGE mm from any other.
 # ---------------------------------------------------------------------------
+BASELINE_MAX_RANGE = 600   # mm: max(dist) - min(dist) threshold to restart collection
 n_seed = BASELINE_SECS * SAMPLE_RATE
-print(f"Collecting {n_seed} samples ({BASELINE_SECS}s) to seed baseline...")
 seed_dist = []
 last_baseline_print = 0.0
+seed_min = seed_max = None
+
+def _start_seed():
+    global seed_dist, seed_min, seed_max, last_baseline_print
+    seed_dist = []
+    seed_min = seed_max = None
+    last_baseline_print = 0.0
+    print(f"Collecting {n_seed} samples ({BASELINE_SECS}s) to seed baseline...")
+
+_start_seed()
 while len(seed_dist) < n_seed:
     d, s, temp_c = read_sample()
+    if seed_min is None:
+        seed_min = seed_max = d
+    else:
+        seed_min = min(seed_min, d)
+        seed_max = max(seed_max, d)
+    if seed_max - seed_min > BASELINE_MAX_RANGE:
+        print(f"  baseline disturbed (range={seed_max-seed_min} mm) — restarting")
+        _start_seed()
+        continue
     seed_dist.append(d)
     t = time.time()
     if t - last_baseline_print >= 0.5:
@@ -803,8 +1021,9 @@ def analyze_event(samples, bg_mean):
     Classify event and extract metrics using rise-time ratio.
     Returns dict with keys: category, object_range_mm, duration_ms, rise_ratio
     """
-    times = np.array([s[0] for s in samples], dtype=float)
-    dists = np.array([s[1] for s in samples], dtype=float)
+    times     = np.array([s[0] for s in samples], dtype=float)
+    dists     = np.array([s[1] for s in samples], dtype=float)
+    strengths = np.array([s[2] for s in samples], dtype=float)
 
     # --- Clean dropouts: replace sentinels with linearly interpolated values ---
     dropout_mask = np.isin(dists, list(DROPOUT_VALUES))
@@ -815,11 +1034,29 @@ def analyze_event(samples, bg_mean):
         dists[nans] = np.interp(idx[nans], idx[~nans], dists[~nans])
 
     excursion = bg_mean - dists          # positive when object present
-    max_exc   = excursion.max()
-    if max_exc <= 0:
+    if excursion.max() <= 0:
         return None                      # no real event
 
-    # --- Rise-time ratio classifier ---
+    # --- Step 1: stable_mask — three consecutive backward diffs all below threshold ---
+    # Point i is stable if |dists[i]-dists[i-1]| < threshold for i, i-1, and i-2.
+    # First two points can never qualify (insufficient history).
+    bdiff = np.abs(np.diff(dists))          # len = N-1; bdiff[i] = |dists[i+1]-dists[i]|
+    stable_mask = np.zeros(len(dists), dtype=bool)
+    for i in range(3, len(dists)):
+        if (bdiff[i-1] < STABLE_RATE_THRESHOLD and
+            bdiff[i-2] < STABLE_RATE_THRESHOLD and
+            bdiff[i-3] < STABLE_RATE_THRESHOLD):
+            stable_mask[i] = True
+
+    # --- Step 2: max_exc from stable points only; fall back to all points if none ---
+    if stable_mask.any():
+        max_exc = float((bg_mean - dists[stable_mask]).max())
+    else:
+        max_exc = float(excursion.max())
+    if max_exc <= 0:
+        return None
+
+    # --- Rise-time ratio classifier (uses full excursion array, not just stable) ---
     above_lo = np.where(excursion >= 0.10 * max_exc)[0]
     above_hi = np.where(excursion >= 0.90 * max_exc)[0]
     if len(above_lo) == 0 or len(above_hi) == 0:
@@ -833,50 +1070,51 @@ def analyze_event(samples, bg_mean):
     category = "pedestrian" if rise_ratio >= RISE_TIME_THRESHOLD else "vehicle"
 
     # --- Object range ---
-    below_mask = excursion > 0
-    if category == "vehicle":
-        # Median of samples on the flat floor (within 10% of minimum dist)
-        min_dist     = dists[below_mask].min()
-        floor_mask   = below_mask & (dists <= min_dist + 0.10 * max_exc)
-        object_range = float(np.median(dists[floor_mask]))
+    # Strength-weighted mean of points that are both stable and have >10% excursion.
+    mask = stable_mask & (excursion > 0.10 * max_exc)
+    if mask.any():
+        object_range = float(np.average(dists[mask], weights=strengths[mask]))
     else:
-        # Parabolic fit over 9 points centred on raw minimum; analytic vertex
-        raw_min_idx = int(np.argmin(dists))
-        half        = 4
-        lo          = max(0, raw_min_idx - half)
-        hi          = min(len(dists) - 1, raw_min_idx + half)
-        window_t    = times[lo:hi+1]
-        window_d    = dists[lo:hi+1]
-        if len(window_d) >= 3:
-            coeffs      = np.polyfit(window_t, window_d, 2)
-            a, b, _     = coeffs
-            if a > 0:                    # parabola opens up → has minimum
-                t_vertex     = -b / (2 * a)
-                object_range = float(np.polyval(coeffs, t_vertex))
-            else:
-                object_range = float(dists[raw_min_idx])
-        else:
-            object_range = float(dists[raw_min_idx])
+        object_range = float(dists[np.argmin(dists)])  # degenerate fallback
 
     # --- Duration: time spent with excursion > 50% of nominal excursion ---
     nominal_exc = bg_mean - object_range
     dur_mask    = excursion > 0.50 * nominal_exc
-    dur_ms      = int(times[dur_mask][-1] - times[dur_mask][0]) if dur_mask.any() else 0
+    if dur_mask.any():
+        dur_ms       = int(times[dur_mask][-1] - times[dur_mask][0])
+        dur_start_ms = int(times[dur_mask][0])
+    else:
+        dur_ms = 0
+        dur_start_ms = int(times[0])
+
+    # --- RMS deviation of valid points from weighted-mean distance ---
+    if mask.any():
+        deviations  = dists[mask] - object_range
+        range_rms   = float(np.sqrt(np.mean(deviations ** 2)))
+    else:
+        range_rms = 0.0
 
     return {
         "category":        category,
         "object_range_mm": round(object_range),
+        "range_rms_mm":    round(range_rms, 1),
         "duration_ms":     dur_ms,
+        "dur_start_ms":    dur_start_ms,
         "rise_ratio":      round(rise_ratio, 3),
+        "valid_indices":   [int(i) for i in np.where(mask)[0]],
     }
-
 def save_event(start_epoch, samples, result):
-    fname = os.path.join(OUTPUT_DIR, f"event_{start_epoch:.3f}.csv")
+    _TZ = pytz.timezone('America/Los_Angeles')
+    dt  = datetime.fromtimestamp(start_epoch, tz=_TZ)
+    ms  = int(round((start_epoch % 1) * 1000))
+    ts  = dt.strftime('%Y%m%d_%H%M%S') + f'_{ms:03d}'
+    fname = os.path.join(OUTPUT_DIR, f"event_{ts}.csv")
     with open(fname, 'w') as f:
         hms_string = datetime.fromtimestamp(start_epoch).strftime('%H:%M:%S.%f')[:-3]
         f.write(f"# start={hms_string} epoch={start_epoch:.3f} bg_mean={bg_mean:.2f} bg_std={bg_std:.3f} units=mm\n")
         if result:
             f.write(f"# category={result['category']}  object_range={result['object_range_mm']}mm"
+                    f"  range_rms={result['range_rms_mm']}mm"
                     f"  duration={result['duration_ms']}ms  rise_ratio={result['rise_ratio']}\n")
         f.write("offset_ms,dist_mm,strength\n")
         for offset_ms, dist, strength in samples:
@@ -884,6 +1122,7 @@ def save_event(start_epoch, samples, result):
     print(f"  saved {fname}  ({len(samples)} samples)")
     if result:
         print(f"  category={result['category']}  object_range={result['object_range_mm']}mm"
+              f"  range_rms={result['range_rms_mm']}mm"
               f"  duration={result['duration_ms']}ms  rise_ratio={result['rise_ratio']}")
 
 sample_idx = 0   # global sample counter used for ms offsets within events
@@ -961,6 +1200,19 @@ while True:
             print(f"  event ended ({end_reason})  {len(event_samples)} samples")
             result = analyze_event(event_samples, bg_mean)
             save_event(event_start_epoch, event_samples, result)
+            # Compute strength stats over valid (non-sentinel) dist samples
+            strengths = [s[2] for s in event_samples if 0 < s[1] < 45000]
+            str_avg = round(sum(strengths) / len(strengths), 1) if strengths else 0
+            str_rms = round((sum(x*x for x in strengths) / len(strengths)) ** 0.5, 1) if strengths else 0
+            log_entry = {
+                "epoch":      event_start_epoch,
+                "category":   result['category']        if result else '',
+                "range_mm":   result['object_range_mm'] if result else 0,
+                "range_rms":  result['range_rms_mm']    if result else 0,
+                "duration_ms":result['duration_ms']     if result else 0,
+                "str_avg":    str_avg,
+                "str_rms":    str_rms,
+            }
             with _web_lock:
                 _web_state['category'] = result['category'] if result else ''
                 _web_state['last_event_id'] = event_start_epoch
@@ -969,11 +1221,16 @@ while True:
                     "category":       result['category']        if result else '',
                     "object_range_mm":result['object_range_mm'] if result else 0,
                     "duration_ms":    result['duration_ms']     if result else 0,
+                    "dur_start_ms":   result['dur_start_ms']    if result else 0,
                     "bg_mean":        bg_mean,
                     "trigger_ms":     trigger_ms,
+                    "valid_indices":  result['valid_indices']   if result else [],
                     # Full 100-sps samples: [offset_ms, dist_mm, strength]
                     "samples":        [[s[0], s[1], s[2]] for s in event_samples],
                 }
+                _recent_events.append(_last_event)
+                _event_log.append(log_entry)
+                _event_epochs.append(event_start_epoch)
             in_event = False
             below_count = 0
             pre_buf.clear()
