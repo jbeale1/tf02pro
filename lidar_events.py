@@ -19,7 +19,7 @@ from flask import Flask, Response, render_template_string
 
 
 # --- Configuration ---
-VERSION = "1.035  2026-06-08"  # fix click by not rebuilding table on every SSE tick
+VERSION = "1.050 2026-06-10"  # sample index for CSV, adjust event threshold, version in CSV
 OUTPUT_DIR    = 'events'
 
 WEB_PORT      = 8080         # LAN web interface port
@@ -34,7 +34,9 @@ TRIGGER_SIGMA = 6.0          # sigma below baseline mean to trigger
 TRIGGER_OFFSET = 100         # additional fixed offset (counts) for trigger threshold
 
 REARM_DIFFERENCE = 500       # absolute difference (mm) to re-arm
-REARM_SECS    = 0.6          # seconds within baseline to consider event over
+MIN_EVENT_SAMPLES = 8        # min samples > MIN_EVENT_EXCURSION mm for valid event
+MIN_EVENT_EXCURSION = 200    # mm: threshold for counting a sample as "off baseline"
+REARM_SECS    = 0.2          # seconds within baseline to consider event over
 MAX_EVENT_SECS = 3.0         # hard cap on event recording length
 
 PRE_TRIGGER   = 10           # samples to prepend from rolling buffer
@@ -77,14 +79,22 @@ _web_state  = {                        # latest single-sample snapshot
     "last_event_id": 0.0,              # epoch of most recent completed event
 }
 # Most recent completed event — stored once, fetched on demand by browser
-_last_event    = None   # dict: {id, category, bg_mean, samples: [[offset_ms, dist], ...]}
+# Use a one-element list so _sensor_loop can update it without a global declaration.
+_last_event    = [None]   # _last_event[0] is the dict (or None)
 _recent_events = collections.deque(maxlen=10) # last 10 full events for selection/overlay
 _event_log  = collections.deque(maxlen=10)  # last 10 event summaries for SSE
 # All event epochs for the current calendar day — used for hourly/daily counts.
 # A deque with a generous cap; at one event/sec for 24 h that's 86400 entries.
 _event_epochs = collections.deque(maxlen=100000)
 
-def _web_push(t, dist, strength, temp_c, in_ev):
+# Recording toggle: when False, completed events are NOT saved to CSV or stored in logs.
+_recording_enabled = True
+
+# Restart event: set() by /restart route; cleared at top of each outer restart loop.
+# Using threading.Event avoids any lock-ordering issues with _web_lock.
+_restart_event = threading.Event()
+
+def _web_push(t, dist, strength, temp_c, in_ev, bg_mean=0.0, bg_std=0.0):
     """Called from main loop after every sample read."""
     with _web_lock:
         _web_buf.append((t, dist, strength, in_ev))
@@ -94,10 +104,9 @@ def _web_push(t, dist, strength, temp_c, in_ev):
             _web_buf.popleft()
         _web_state.update({
             "dist": dist, "strength": strength, "temp_c": temp_c,
-            "bg_mean": bg_mean if 'bg_mean' in globals() else 0.0,
-            "bg_std":  bg_std  if 'bg_std'  in globals() else 0.0,
-            "trigger": (bg_mean - TRIGGER_SIGMA * bg_std - TRIGGER_OFFSET)
-                       if 'bg_mean' in globals() else 0.0,
+            "bg_mean": bg_mean,
+            "bg_std":  bg_std,
+            "trigger": (bg_mean - TRIGGER_SIGMA * bg_std - TRIGGER_OFFSET),
             "in_event": in_ev, "ts": t,
         })
 
@@ -164,6 +173,30 @@ _PAGE_HTML = r"""<!DOCTYPE html>
                font-size: .78rem; color: var(--dim); }
   #stats-bar b { color: var(--text); font-weight: bold; }
   #version-str { font-size: .68rem; color: #a0b0b8; font-style: italic; }
+
+  /* ── recording toggle ── */
+  #btn-record { font-family: var(--mono); font-size: .78rem; padding: .2rem .7rem;
+                border-radius: 3px; cursor: pointer; border: 1px solid;
+                transition: background .15s, color .15s; }
+  #btn-record.rec-on  { background: #e8f4e8; color: #1a7a30; border-color: #6ab87a; }
+  #btn-record.rec-off { background: #fce8e8; color: var(--warn); border-color: #d08080; }
+
+  /* ── restart button ── */
+  #btn-restart { font-family: var(--mono); font-size: .78rem; padding: .2rem .7rem;
+                 border-radius: 3px; cursor: pointer;
+                 border: 1px solid #a0a8b8; background: var(--panel); color: var(--dim); }
+  #btn-restart:hover   { background: #f0f4ff; color: var(--accent); border-color: var(--accent); }
+  #btn-restart.seeding { background: #fff8e0; color: #886600; border-color: #c8a830;
+                         animation: seedpulse 1s ease-in-out infinite; }
+  @keyframes seedpulse {
+    0%, 100% { opacity: 1; } 50% { opacity: .55; }
+  }
+
+  /* ── clear button ── */
+  #btn-clear { font-family: var(--mono); font-size: .78rem; padding: .2rem .7rem;
+               border-radius: 3px; cursor: pointer;
+               border: 1px solid #a0a8b8; background: var(--panel); color: var(--dim); }
+  #btn-clear:hover { background: #fff0f0; color: var(--warn); border-color: var(--warn); }
 
   /* ── event log table ── */
   #event-log { width: 100%; max-width: 760px; margin-top: 1.2rem;
@@ -250,6 +283,9 @@ _PAGE_HTML = r"""<!DOCTYPE html>
 
 <div id="stats-bar">
   <span>Last 60 min: <b id="cnt-60">–</b> &nbsp; Today: <b id="cnt-day">–</b></span>
+  <button id="btn-record" class="rec-on" onclick="toggleRecording()">● REC ON</button>
+  <button id="btn-restart" onclick="requestRestart()">↺ RESTART</button>
+  <button id="btn-clear" onclick="clearHistory()">✕ CLEAR</button>
   <span id="version-str">v<!--VER--></span>
 </div>
 
@@ -267,6 +303,38 @@ let   evDataList    = [];     // last 10 full events (newest last)
 let   lastEvId      = 0;
 let   overlayOn     = false;
 let   selectedEvIdx = null;   // index into evDataList of selected row (null = latest)
+let   recOn         = true;   // mirrors server-side _recording_enabled
+
+function requestRestart() {
+  const btn = document.getElementById('btn-restart');
+  btn.classList.add('seeding');
+  btn.textContent = '\u21ba SEEDING\u2026';
+  fetch('/restart', {method: 'POST'});
+}
+function clearHistory() {
+  fetch('/clear', {method: 'POST'});
+  // Clear client-side display immediately
+  evData = null;
+  evDataList = [];
+  selectedEvIdx = null;
+  lastEvId = 0;
+  rebuildTable([]);
+  drawEventChart();
+  document.getElementById('cnt-60').textContent  = '0';
+  document.getElementById('cnt-day').textContent = '0';
+}
+
+function toggleRecording() {
+  fetch('/toggle_recording', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => setRecordingUI(d.recording));
+}
+function setRecordingUI(on) {
+  recOn = on;
+  const btn = document.getElementById('btn-record');
+  btn.textContent = on ? '\u25cf REC ON' : '\u25cb REC OFF';
+  btn.className   = on ? 'rec-on' : 'rec-off';
+}
 
 function toggleOverlay() {
   overlayOn = !overlayOn;
@@ -514,7 +582,7 @@ const OVERLAY_STR_COLORS  = ['rgba(26,122,48,0.55)','rgba(26,122,48,0.38)',
                               'rgba(26,122,48,0.14)'];
 
 // Draw one event's strength + distance traces onto xEvent.
-// toSec(offset_ms, ev) returns the X value (% of dur window).
+// toSec(sampleNum, ev) returns the X value (% of dur window).
 function drawEventTrace(ev, toSec, tx, ty, sy, distColor, strColor) {
   const samps    = ev.samples;
   const validSet = new Set(ev.valid_indices || []);
@@ -578,9 +646,9 @@ function drawEvent() {
   }
   if (drawList.length === 0) return;
 
-  // toSec: converts offset_ms to % of that event's dur window
+  // toSec: converts sample index to % of that event's dur window
   // 0% = dur_start_ms, 100% = dur_start_ms + duration_ms
-  const toSec = (ms, ev) => (ms - (ev.dur_start_ms || 0)) / Math.max(ev.duration_ms || 1, 1) * 100;
+  const toSec = (sampleNum, ev) => (sampleNum * 10 - (ev.dur_start_ms || 0)) / Math.max(ev.duration_ms || 1, 1) * 100;
 
   // Fixed X axis: -20% to +120%
   const tMin = -20, tMax = 120;
@@ -598,7 +666,8 @@ function drawEvent() {
   if (allD.length === 0) return;
 
   const evBg      = evData.bg_mean;
-  const dMax      = Math.max(...allD, evBg) + 30;
+  const dMaxRaw   = Math.max(...allD, evBg) + 30;
+  const dMax      = Math.min(dMaxRaw, evBg + 1000);   // never exceed baseline + 1 m
   const dMin      = Math.min(...allD) - Math.max(30, (dMax - Math.min(...allD)) * 0.05);
   const dRange    = dMax - dMin || 1;
   const sLogMin   = Math.log10(Math.max(1, Math.min(...allS) * 0.9));
@@ -618,16 +687,19 @@ function drawEvent() {
   xEvent.strokeStyle = COL_GRID;
   xEvent.lineWidth   = 1;
 
-  // Left Y-axis: distance in integer metres
-  const rawStep = (dMax - dMin) / 5;
-  const mag     = Math.pow(10, Math.floor(Math.log10(rawStep)));
-  const yStep   = Math.ceil(rawStep / mag) * mag;
+  // Left Y-axis: distance labels with 1 decimal place (e.g. 12.5 m)
+  // Pick a tick step from nice 0.1 m multiples: 100,200,500,1000,2000,5000 mm...
+  const NICE_STEPS_MM = [100, 200, 500, 1000, 2000, 5000, 10000];
+  const targetTicks   = 5;
+  const rawStepEv     = (dMax - dMin) / targetTicks;
+  let yStep = NICE_STEPS_MM[NICE_STEPS_MM.length - 1];
+  for (const s of NICE_STEPS_MM) { if (s >= rawStepEv) { yStep = s; break; } }
   const yFirst  = Math.ceil(dMin / yStep) * yStep;
   for (let d = yFirst; d <= dMax; d += yStep) {
     const y = ty(d);
     xEvent.beginPath(); xEvent.moveTo(ml, y); xEvent.lineTo(W - mr, y); xEvent.stroke();
     xEvent.textAlign = 'right'; xEvent.textBaseline = 'middle';
-    xEvent.fillText(Math.round(d / 1000), ml - 4, y);
+    xEvent.fillText((d / 1000).toFixed(1), ml - 4, y);
   }
 
   // X-axis: ticks every 20%
@@ -763,10 +835,9 @@ src.onmessage = e => {
       .then(r => r.json())
       .then(list => {
         evDataList = list;
-        if (selectedEvIdx === null || selectedEvIdx === evDataList.length - 2) {
-          selectedEvIdx = null;
-          evData = list.length ? list[list.length - 1] : null;
-        }
+        // Always snap selection to newest event when a new one arrives
+        selectedEvIdx = null;
+        evData = list.length ? list[list.length - 1] : null;
         if (evData) {
           updateChartLabel(evData);
           setLastEventReadout(evData.object_range_mm);
@@ -781,6 +852,19 @@ src.onmessage = e => {
     document.getElementById('cnt-60').textContent  = msg.count_60min;
   if (msg.count_today !== undefined)
     document.getElementById('cnt-day').textContent = msg.count_today;
+
+  // Sync recording toggle button with server state
+  if (msg.recording !== undefined && msg.recording !== recOn)
+    setRecordingUI(msg.recording);
+
+  // Clear seeding indicator once server confirms it's no longer restarting
+  if (msg.restarting === false) {
+    const btn = document.getElementById('btn-restart');
+    if (btn.classList.contains('seeding')) {
+      btn.classList.remove('seeding');
+      btn.textContent = '\u21ba RESTART';
+    }
+  }
 
   // Table only rebuilt when a new event arrives (handled above); no-op here.
 
@@ -844,7 +928,7 @@ def _index():
 @_flask_app.route('/event')
 def _event():
     with _web_lock:
-        ev = _last_event
+        ev = _last_event[0]
     if ev is None:
         return Response('{}', mimetype='application/json')
     return Response(json.dumps(ev), mimetype='application/json')
@@ -855,8 +939,57 @@ def _events():
         evs = list(_recent_events)
     return Response(json.dumps(evs), mimetype='application/json')
 
+@_flask_app.route('/toggle_recording', methods=['POST'])
+def _toggle_recording():
+    global _recording_enabled
+    with _web_lock:
+        _recording_enabled = not _recording_enabled
+        state = _recording_enabled
+    print(f"[{time.strftime('%H:%M:%S')}] Recording {'ENABLED' if state else 'DISABLED'} via web toggle")
+    return Response(json.dumps({"recording": state}), mimetype='application/json')
+
+@_flask_app.route('/clear', methods=['POST'])
+def _clear():
+    with _web_lock:
+        _last_event[0] = None
+        _recent_events.clear()
+        _event_log.clear()
+        _event_epochs.clear()
+    print(f"[{time.strftime('%H:%M:%S')}] Event history cleared via web button")
+    return Response(json.dumps({"ok": True}), mimetype='application/json')
+
+@_flask_app.route('/restart', methods=['POST'])
+def _restart():
+    _restart_event.set()
+    print(f"[{time.strftime('%H:%M:%S')}] Restart requested via web button")
+    return Response(json.dumps({"ok": True}), mimetype='application/json')
+
+@_flask_app.route('/debug')
+def _debug():
+    with _web_lock:
+        snap = dict(_web_state)
+        buf_len = len(_web_buf)
+        log_len = len(_event_log)
+        epochs_len = len(_event_epochs)
+        recent_len = len(_recent_events)
+    info = {
+        "web_state": snap,
+        "web_buf_len": buf_len,
+        "event_log_len": log_len,
+        "event_epochs_len": epochs_len,
+        "recent_events_len": recent_len,
+        "last_event_is_none": _last_event[0] is None,
+        "sse_connect_count": _sse_connect_count,
+    }
+    return Response(json.dumps(info, indent=2), mimetype='application/json')
+
+_sse_connect_count = 0
+
 @_flask_app.route('/stream')
 def _stream():
+    global _sse_connect_count
+    _sse_connect_count += 1
+    print(f"[{time.strftime('%H:%M:%S')}] SSE client connected (total={_sse_connect_count})")
     def gen():
         interval = 1.0 / WEB_HZ
         while True:
@@ -908,6 +1041,8 @@ def _stream():
                                           if now_t - e <= 3600)
                 snap['count_today'] = sum(1 for e in _event_epochs
                                           if e >= midnight)
+                snap['recording'] = _recording_enabled
+                snap['restarting'] = _restart_event.is_set()
             snap['history'] = history
             payload = json.dumps(snap)
             yield f"data: {payload}\n\n"
@@ -921,11 +1056,9 @@ def _start_web_server():
     log.setLevel(logging.WARNING)   # suppress per-request noise
     _flask_app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
 
-threading.Thread(target=_start_web_server, daemon=True, name='flask').start()
-print(f"Web interface starting on http://0.0.0.0:{WEB_PORT}/  (LAN accessible)")
-
 # --- Setup ---
 print("TF02-Pro LIDAR Event Logger  Version", VERSION)
+print(f"Web interface will start on http://0.0.0.0:{WEB_PORT}/  (LAN accessible)")
 
 PORT = find_ch341_port()  # auto select the right port (assuming no other similar devices)
 # PORT          = '/dev/ttyUSB1'
@@ -958,279 +1091,321 @@ def read_sample():
                     return dist, strength, temp_c
 
 # ---------------------------------------------------------------------------
-# Phase 1: seed baseline from BASELINE_SECS seconds of quiet readings
-# Restarts if any sample deviates more than BASELINE_MAX_RANGE mm from any other.
+# Phase 1 + 2: wrapped in an outer restart loop
 # ---------------------------------------------------------------------------
 BASELINE_MAX_RANGE = 600   # mm: max(dist) - min(dist) threshold to restart collection
 n_seed = BASELINE_SECS * SAMPLE_RATE
-seed_dist = []
-last_baseline_print = 0.0
-seed_min = seed_max = None
-
-def _start_seed():
-    global seed_dist, seed_min, seed_max, last_baseline_print
-    seed_dist = []
-    seed_min = seed_max = None
-    last_baseline_print = 0.0
-    print(f"Collecting {n_seed} samples ({BASELINE_SECS}s) to seed baseline...")
-
-_start_seed()
-while len(seed_dist) < n_seed:
-    d, s, temp_c = read_sample()
-    if seed_min is None:
-        seed_min = seed_max = d
-    else:
-        seed_min = min(seed_min, d)
-        seed_max = max(seed_max, d)
-    if seed_max - seed_min > BASELINE_MAX_RANGE:
-        print(f"  baseline disturbed (range={seed_max-seed_min} mm) — restarting")
-        _start_seed()
-        continue
-    seed_dist.append(d)
-    t = time.time()
-    if t - last_baseline_print >= 0.5:
-        print(f"  baseline sample: dist={d} mm  strength={s}  temp={temp_c:.1f} C")
-        last_baseline_print = t
-
-bg_mean = float(np.mean(seed_dist))
-bg_std  = float(np.std(seed_dist))
-trigger_thresh = bg_mean - TRIGGER_SIGMA * bg_std - TRIGGER_OFFSET
-
-print(f"Baseline: mean={bg_mean:.2f} mm  std={bg_std:.3f} mm")
-print(f"Trigger threshold: < {trigger_thresh:.2f} mm")
-print(f"Writing events to: {os.path.abspath(OUTPUT_DIR)}/")
-
-# ---------------------------------------------------------------------------
-# Phase 2: live detection loop
-# ---------------------------------------------------------------------------
-pre_buf = collections.deque(maxlen=PRE_TRIGGER)  # rolling (timestamp, dist, strength)
-below_count  = 0          # consecutive samples below trigger threshold
-in_event     = False
-rearm_count  = 0          # consecutive samples back within baseline
-event_samples = []        # list of (offset_ms, dist, strength) for current event
-event_t0      = None      # absolute time of first event sample (after pre-trigger)
-event_start_epoch = None
 
 MAX_EVENT_SAMPLES = int(MAX_EVENT_SECS * SAMPLE_RATE)
 REARM_SAMPLES     = int(REARM_SECS    * SAMPLE_RATE)
-last_status_time  = time.time()
-last_event_print_time = 0.0
 
-def analyze_event(samples, bg_mean):
-    """
-    Classify event and extract metrics using rise-time ratio.
-    Returns dict with keys: category, object_range_mm, duration_ms, rise_ratio
-    """
-    times     = np.array([s[0] for s in samples], dtype=float)
-    dists     = np.array([s[1] for s in samples], dtype=float)
-    strengths = np.array([s[2] for s in samples], dtype=float)
+def _sensor_loop():
+    """Seed baseline then run detection loop. Restarts on _restart_event."""
+    def _start_seed():
+        nonlocal seed_dist, seed_min, seed_max, last_baseline_print
+        seed_dist = []
+        seed_min = seed_max = None
+        last_baseline_print = 0.0
+        print(f"Collecting {n_seed} samples ({BASELINE_SECS}s) to seed baseline...")
 
-    # --- Clean dropouts: replace sentinels with linearly interpolated values ---
-    dropout_mask = np.isin(dists, list(DROPOUT_VALUES))
-    if dropout_mask.any():
-        dists[dropout_mask] = np.nan
-        nans = np.isnan(dists)
-        idx  = np.arange(len(dists))
-        dists[nans] = np.interp(idx[nans], idx[~nans], dists[~nans])
+    def analyze_event(samples, bg_mean):
+        """
+        Classify event and extract metrics using rise-time ratio.
+        Returns dict with keys: category, object_range_mm, duration_ms, rise_ratio
+        """
+        times     = np.array([s[0] for s in samples], dtype=float)
+        dists     = np.array([s[1] for s in samples], dtype=float)
+        strengths = np.array([s[2] for s in samples], dtype=float)
 
-    excursion = bg_mean - dists          # positive when object present
-    if excursion.max() <= 0:
-        return None                      # no real event
+        # --- Clean dropouts: replace sentinels with linearly interpolated values ---
+        dropout_mask = np.isin(dists, list(DROPOUT_VALUES))
+        if dropout_mask.any():
+            dists[dropout_mask] = np.nan
+            nans = np.isnan(dists)
+            idx  = np.arange(len(dists))
+            dists[nans] = np.interp(idx[nans], idx[~nans], dists[~nans])
 
-    # --- Step 1: stable_mask — three consecutive backward diffs all below threshold ---
-    # Point i is stable if |dists[i]-dists[i-1]| < threshold for i, i-1, and i-2.
-    # First two points can never qualify (insufficient history).
-    bdiff = np.abs(np.diff(dists))          # len = N-1; bdiff[i] = |dists[i+1]-dists[i]|
-    stable_mask = np.zeros(len(dists), dtype=bool)
-    for i in range(3, len(dists)):
-        if (bdiff[i-1] < STABLE_RATE_THRESHOLD and
-            bdiff[i-2] < STABLE_RATE_THRESHOLD and
-            bdiff[i-3] < STABLE_RATE_THRESHOLD):
-            stable_mask[i] = True
+        excursion = bg_mean - dists          # positive when object present
+        if excursion.max() <= 0:
+            return None                      # no real event
 
-    # --- Step 2: max_exc from stable points only; fall back to all points if none ---
-    if stable_mask.any():
-        max_exc = float((bg_mean - dists[stable_mask]).max())
-    else:
-        max_exc = float(excursion.max())
-    if max_exc <= 0:
-        return None
+        # --- Step 1: stable_mask — three consecutive backward diffs all below threshold ---
+        # Point i is stable if |dists[i]-dists[i-1]| < threshold for i, i-1, and i-2.
+        # First two points can never qualify (insufficient history).
+        bdiff = np.abs(np.diff(dists))          # len = N-1; bdiff[i] = |dists[i+1]-dists[i]|
+        stable_mask = np.zeros(len(dists), dtype=bool)
+        for i in range(3, len(dists)):
+            if (bdiff[i-1] < STABLE_RATE_THRESHOLD and
+                bdiff[i-2] < STABLE_RATE_THRESHOLD and
+                bdiff[i-3] < STABLE_RATE_THRESHOLD):
+                stable_mask[i] = True
 
-    # --- Rise-time ratio classifier (uses full excursion array, not just stable) ---
-    above_lo = np.where(excursion >= 0.10 * max_exc)[0]
-    above_hi = np.where(excursion >= 0.90 * max_exc)[0]
-    if len(above_lo) == 0 or len(above_hi) == 0:
-        rise_ratio = 1.0                 # degenerate — treat as pedestrian
-    else:
-        lead_time  = times[above_hi[0]]  - times[above_lo[0]]   # 10%→90% on entry
-        trail_time = times[above_lo[-1]] - times[above_hi[-1]]  # 90%→10% on exit
-        total_time = times[above_lo[-1]] - times[above_lo[0]]   # full width at 10%
-        rise_ratio = float((lead_time + trail_time) / total_time) if total_time > 0 else 1.0
+        # --- Step 2: max_exc from stable points only; fall back to all points if none ---
+        if stable_mask.any():
+            max_exc = float((bg_mean - dists[stable_mask]).max())
+        else:
+            max_exc = float(excursion.max())
+        if max_exc <= 0:
+            return None
 
-    category = "pedestrian" if rise_ratio >= RISE_TIME_THRESHOLD else "vehicle"
+        # --- Rise-time ratio classifier (uses full excursion array, not just stable) ---
+        above_lo = np.where(excursion >= 0.10 * max_exc)[0]
+        above_hi = np.where(excursion >= 0.90 * max_exc)[0]
+        if len(above_lo) == 0 or len(above_hi) == 0:
+            rise_ratio = 1.0                 # degenerate — treat as pedestrian
+        else:
+            lead_time  = times[above_hi[0]]  - times[above_lo[0]]   # 10%→90% on entry
+            trail_time = times[above_lo[-1]] - times[above_hi[-1]]  # 90%→10% on exit
+            total_time = times[above_lo[-1]] - times[above_lo[0]]   # full width at 10%
+            rise_ratio = float((lead_time + trail_time) / total_time) if total_time > 0 else 1.0
 
-    # --- Object range ---
-    # Strength-weighted mean of points that are both stable and have >10% excursion.
-    mask = stable_mask & (excursion > 0.10 * max_exc)
-    if mask.any():
-        object_range = float(np.average(dists[mask], weights=strengths[mask]))
-    else:
-        object_range = float(dists[np.argmin(dists)])  # degenerate fallback
+        category = "pedestrian" if rise_ratio >= RISE_TIME_THRESHOLD else "vehicle"
 
-    # --- Duration: time spent with excursion > 50% of nominal excursion ---
-    nominal_exc = bg_mean - object_range
-    dur_mask    = excursion > 0.50 * nominal_exc
-    if dur_mask.any():
-        dur_ms       = int(times[dur_mask][-1] - times[dur_mask][0])
-        dur_start_ms = int(times[dur_mask][0])
-    else:
-        dur_ms = 0
-        dur_start_ms = int(times[0])
+        # --- Object range ---
+        # Strength-weighted mean of points that are both stable and have >10% excursion.
+        mask = stable_mask & (excursion > 0.10 * max_exc)
+        if mask.any():
+            object_range = float(np.average(dists[mask], weights=strengths[mask]))
+        else:
+            object_range = float(dists[np.argmin(dists)])  # degenerate fallback
 
-    # --- RMS deviation of valid points from weighted-mean distance ---
-    if mask.any():
-        deviations  = dists[mask] - object_range
-        range_rms   = float(np.sqrt(np.mean(deviations ** 2)))
-    else:
-        range_rms = 0.0
+        # --- Duration: time spent with excursion > 50% of nominal excursion ---
+        nominal_exc = bg_mean - object_range
+        dur_mask    = excursion > 0.50 * nominal_exc
+        if dur_mask.any():
+            dur_ms       = int((times[dur_mask][-1] - times[dur_mask][0]) * 10)
+            dur_start_ms = int(times[dur_mask][0] * 10)
+        else:
+            dur_ms = 0
+            dur_start_ms = int(times[0] * 10)
 
-    return {
-        "category":        category,
-        "object_range_mm": round(object_range),
-        "range_rms_mm":    round(range_rms, 1),
-        "duration_ms":     dur_ms,
-        "dur_start_ms":    dur_start_ms,
-        "rise_ratio":      round(rise_ratio, 3),
-        "valid_indices":   [int(i) for i in np.where(mask)[0]],
-    }
-def save_event(start_epoch, samples, result):
-    _TZ = pytz.timezone('America/Los_Angeles')
-    dt  = datetime.fromtimestamp(start_epoch, tz=_TZ)
-    ms  = int(round((start_epoch % 1) * 1000))
-    ts  = dt.strftime('%Y%m%d_%H%M%S') + f'_{ms:03d}'
-    fname = os.path.join(OUTPUT_DIR, f"event_{ts}.csv")
-    with open(fname, 'w') as f:
-        hms_string = datetime.fromtimestamp(start_epoch).strftime('%H:%M:%S.%f')[:-3]
-        f.write(f"# start={hms_string} epoch={start_epoch:.3f} bg_mean={bg_mean:.2f} bg_std={bg_std:.3f} units=mm\n")
+        # --- RMS deviation of valid points from weighted-mean distance ---
+        if mask.any():
+            deviations  = dists[mask] - object_range
+            range_rms   = float(np.sqrt(np.mean(deviations ** 2)))
+        else:
+            range_rms = 0.0
+
+        return {
+            "category":        category,
+            "object_range_mm": round(object_range),
+            "range_rms_mm":    round(range_rms, 1),
+            "duration_ms":     dur_ms,
+            "dur_start_ms":    dur_start_ms,
+            "rise_ratio":      round(rise_ratio, 3),
+            "valid_indices":   [int(i) for i in np.where(mask)[0]],
+        }
+    def save_event(start_epoch, samples, result):
+        _TZ = pytz.timezone('America/Los_Angeles')
+        dt  = datetime.fromtimestamp(start_epoch, tz=_TZ)
+        ms  = int(round((start_epoch % 1) * 1000))
+        ts  = dt.strftime('%Y%m%d_%H%M%S') + f'_{ms:03d}'
+        fname = os.path.join(OUTPUT_DIR, f"event_{ts}.csv")
+        with open(fname, 'w') as f:
+            hms_string = datetime.fromtimestamp(start_epoch).strftime('%H:%M:%S.%f')[:-3]            
+            f.write(f"# start={hms_string} epoch={start_epoch:.3f} bg_mean={bg_mean:.2f} bg_std={bg_std:.3f} units=mm version=\"{VERSION}\"\n")
+            if result:
+                f.write(f"# category={result['category']}  object_range={result['object_range_mm']}mm"
+                        f"  range_rms={result['range_rms_mm']}mm"
+                        f"  duration={result['duration_ms']}ms  rise_ratio={result['rise_ratio']}\n")
+            f.write("sample,dist_mm,strength\n")
+            for sample_num, dist, strength in samples:
+                f.write(f"{sample_num},{dist},{strength}\n")
+        print(f"  saved {fname}  ({len(samples)} samples)")
         if result:
-            f.write(f"# category={result['category']}  object_range={result['object_range_mm']}mm"
-                    f"  range_rms={result['range_rms_mm']}mm"
-                    f"  duration={result['duration_ms']}ms  rise_ratio={result['rise_ratio']}\n")
-        f.write("offset_ms,dist_mm,strength\n")
-        for offset_ms, dist, strength in samples:
-            f.write(f"{offset_ms},{dist},{strength}\n")
-    print(f"  saved {fname}  ({len(samples)} samples)")
-    if result:
-        print(f"  category={result['category']}  object_range={result['object_range_mm']}mm"
-              f"  range_rms={result['range_rms_mm']}mm"
-              f"  duration={result['duration_ms']}ms  rise_ratio={result['rise_ratio']}")
+            print(f"  category={result['category']}  object_range={result['object_range_mm']}mm"
+                  f"  range_rms={result['range_rms_mm']}mm"
+                  f"  duration={result['duration_ms']}ms  rise_ratio={result['rise_ratio']}")
 
-sample_idx = 0   # global sample counter used for ms offsets within events
+    while True:   # ── outer restart loop ──────────────────────────────────────
 
-while True:
-    d, strength, temp_c = read_sample()
-    t_now = time.time()
-    sample_idx += 1
+        # Clear restart event at the top of each outer iteration
+        _restart_event.clear()
 
-    trigger_thresh = bg_mean - TRIGGER_SIGMA * bg_std - TRIGGER_OFFSET
-    _web_push(t_now, d, strength, temp_c, in_event)
+        # -----------------------------------------------------------------------
+        # Phase 1: seed baseline
+        # -----------------------------------------------------------------------
+        seed_dist = []
+        last_baseline_print = 0.0
+        seed_min = seed_max = None
 
-    if not in_event:
-        pre_buf.append((t_now, d, strength))
+        _start_seed()
+        restart_during_seed = False
+        while len(seed_dist) < n_seed:
+            if _restart_event.is_set():
+                restart_during_seed = True
+                break
+            d, s, temp_c = read_sample()
+            if seed_min is None:
+                seed_min = seed_max = d
+            else:
+                seed_min = min(seed_min, d)
+                seed_max = max(seed_max, d)
+            if seed_max - seed_min > BASELINE_MAX_RANGE:
+                print(f"  baseline disturbed (range={seed_max-seed_min} mm) — restarting")
+                _start_seed()
+                continue
+            seed_dist.append(d)
+            t = time.time()
+            if t - last_baseline_print >= 0.5:
+                print(f"  baseline sample: dist={d} mm  strength={s}  temp={temp_c:.1f} C")
+                last_baseline_print = t
 
-        # Check trigger: N consecutive samples below threshold
-        if d < trigger_thresh:
-            below_count += 1
-        else:
-            below_count = 0
+        if restart_during_seed:
+            print(f"[{time.strftime('%H:%M:%S')}] Restart during seeding — restarting now")
+            continue   # back to top of outer restart loop
 
-        if below_count >= TRIGGER_N:
-            in_event = True
-            rearm_count = 0
-            event_samples = []
+        bg_mean = float(np.mean(seed_dist))
+        bg_std  = float(np.std(seed_dist))
+        trigger_thresh = bg_mean - TRIGGER_SIGMA * bg_std - TRIGGER_OFFSET
 
-            # Prepend pre-trigger buffer (all of it; includes the triggering samples)
-            t_pre0 = pre_buf[0][0]
-            for tb, db, sb in pre_buf:
-                offset_ms = round((tb - t_pre0) * 1000)
-                event_samples.append((offset_ms, db, sb))
+        print(f"Baseline: mean={bg_mean:.2f} mm  std={bg_std:.3f} mm")
+        print(f"Trigger threshold: < {trigger_thresh:.2f} mm")
+        print(f"Writing events to: {os.path.abspath(OUTPUT_DIR)}/")
 
-            # ms offset of the first sample that crossed below threshold
-            trigger_ms = round((list(pre_buf)[-TRIGGER_N][0] - t_pre0) * 1000)
+        # -----------------------------------------------------------------------
+        # Phase 2: live detection loop
+        # -----------------------------------------------------------------------
+        pre_buf = collections.deque(maxlen=PRE_TRIGGER)
+        below_count  = 0
+        in_event     = False
+        rearm_count  = 0
+        event_samples = []
+        event_t0      = None
+        event_start_epoch = None
+        last_status_time  = time.time()
+        last_event_print_time = 0.0
 
-            event_start_epoch = t_pre0
-            t_str = f"{time.strftime('%H:%M:%S', time.localtime(t_now))}.{int(t_now % 1 * 1000):03d}"
-            print(f"EVENT triggered at {t_str}  dist={d}  threshold={trigger_thresh:.1f}")
+        sample_idx = 0   # global sample counter used for ms offsets within events
 
-        else:
-            # Update slow EMA baseline only when signal is quiet
-            if bg_std > 0 and abs(d - bg_mean) < QUIET_STD_MULT * bg_std:
-                bg_mean = EMA_ALPHA * d + (1 - EMA_ALPHA) * bg_mean
-                # Update bg_std as EMA of squared deviation
-                bg_std = float(np.sqrt(
-                    EMA_ALPHA * (d - bg_mean) ** 2 + (1 - EMA_ALPHA) * bg_std ** 2
-                ))
+        while True:
+            # Check for restart request — break to outer loop immediately
+            if _restart_event.is_set():
+                break
 
-        if t_now - last_status_time >= 60.0:
-            print(f"[{time.strftime('%H:%M:%S')}] baseline={bg_mean:.2f} mm  std={bg_std:.3f} mm  trigger<{trigger_thresh:.2f} mm  temp={temp_c:.1f} C")
-            last_status_time = t_now
+            d, strength, temp_c = read_sample()
+            t_now = time.time()
+            sample_idx += 1
 
-    else:
-        # Recording event
-        offset_ms = round((t_now - event_start_epoch) * 1000)
-        event_samples.append((offset_ms, d, strength))
+            trigger_thresh = bg_mean - TRIGGER_SIGMA * bg_std - TRIGGER_OFFSET
+            _web_push(t_now, d, strength, temp_c, in_event, bg_mean, bg_std)
 
-        if t_now - last_event_print_time >= 0.5:
-            print(f"  +{offset_ms}ms  dist={d} mm  strength={strength}")
-            last_event_print_time = t_now
+            if not in_event:
+                pre_buf.append((t_now, d, strength))
 
-        # Check re-arm condition: sustained return to baseline
-        if abs(d - bg_mean) <= REARM_DIFFERENCE:
-            rearm_count += 1
-        else:
-            rearm_count = 0
+                # Check trigger: N consecutive samples below threshold
+                if d < trigger_thresh:
+                    below_count += 1
+                else:
+                    below_count = 0
 
-        end_reason = None
-        if rearm_count >= REARM_SAMPLES:
-            end_reason = "rearm"
-        elif len(event_samples) >= MAX_EVENT_SAMPLES:
-            end_reason = "timeout"
+                if below_count >= TRIGGER_N:
+                    in_event = True
+                    rearm_count = 0
+                    event_samples = []
 
-        if end_reason:
-            print(f"  event ended ({end_reason})  {len(event_samples)} samples")
-            result = analyze_event(event_samples, bg_mean)
-            save_event(event_start_epoch, event_samples, result)
-            # Compute strength stats over valid (non-sentinel) dist samples
-            strengths = [s[2] for s in event_samples if 0 < s[1] < 45000]
-            str_avg = round(sum(strengths) / len(strengths), 1) if strengths else 0
-            str_rms = round((sum(x*x for x in strengths) / len(strengths)) ** 0.5, 1) if strengths else 0
-            log_entry = {
-                "epoch":      event_start_epoch,
-                "category":   result['category']        if result else '',
-                "range_mm":   result['object_range_mm'] if result else 0,
-                "range_rms":  result['range_rms_mm']    if result else 0,
-                "duration_ms":result['duration_ms']     if result else 0,
-                "str_avg":    str_avg,
-                "str_rms":    str_rms,
-            }
-            with _web_lock:
-                _web_state['category'] = result['category'] if result else ''
-                _web_state['last_event_id'] = event_start_epoch
-                _last_event = {
-                    "id":             event_start_epoch,
-                    "category":       result['category']        if result else '',
-                    "object_range_mm":result['object_range_mm'] if result else 0,
-                    "duration_ms":    result['duration_ms']     if result else 0,
-                    "dur_start_ms":   result['dur_start_ms']    if result else 0,
-                    "bg_mean":        bg_mean,
-                    "trigger_ms":     trigger_ms,
-                    "valid_indices":  result['valid_indices']   if result else [],
-                    # Full 100-sps samples: [offset_ms, dist_mm, strength]
-                    "samples":        [[s[0], s[1], s[2]] for s in event_samples],
-                }
-                _recent_events.append(_last_event)
-                _event_log.append(log_entry)
-                _event_epochs.append(event_start_epoch)
-            in_event = False
-            below_count = 0
-            pre_buf.clear()
+                    # Prepend pre-trigger buffer (all of it; includes the triggering samples)
+                    t_pre0 = pre_buf[0][0]
+                    for i, (tb, db, sb) in enumerate(pre_buf):
+                        event_samples.append((i, db, sb))
+
+                    # sample index of the first sample that crossed below threshold
+                    trigger_ms = (len(pre_buf) - TRIGGER_N) * 10
+
+                    event_start_epoch = t_pre0
+                    t_str = f"{time.strftime('%H:%M:%S', time.localtime(t_now))}.{int(t_now % 1 * 1000):03d}"
+                    print(f"EVENT triggered at {t_str}  dist={d}  threshold={trigger_thresh:.1f}")
+
+                else:
+                    # Update slow EMA baseline only when signal is quiet
+                    if bg_std > 0 and abs(d - bg_mean) < QUIET_STD_MULT * bg_std:
+                        bg_mean = EMA_ALPHA * d + (1 - EMA_ALPHA) * bg_mean
+                        # Update bg_std as EMA of squared deviation
+                        bg_std = float(np.sqrt(
+                            EMA_ALPHA * (d - bg_mean) ** 2 + (1 - EMA_ALPHA) * bg_std ** 2
+                        ))
+
+                if t_now - last_status_time >= 60.0:
+                    print(f"[{time.strftime('%H:%M:%S')}] baseline={bg_mean:.2f} mm  std={bg_std:.3f} mm  trigger<{trigger_thresh:.2f} mm  temp={temp_c:.1f} C")
+                    last_status_time = t_now
+
+            else:
+                # Recording event
+                event_samples.append((len(event_samples), d, strength))
+
+                if t_now - last_event_print_time >= 0.5:
+                    print(f"  +{len(event_samples)*10}ms  dist={d} mm  strength={strength}")
+                    last_event_print_time = t_now
+
+                # Check re-arm condition: sustained return to baseline
+                if abs(d - bg_mean) <= REARM_DIFFERENCE:
+                    rearm_count += 1
+                else:
+                    rearm_count = 0
+
+                end_reason = None
+                if rearm_count >= REARM_SAMPLES:
+                    end_reason = "rearm"
+                elif len(event_samples) >= MAX_EVENT_SAMPLES:
+                    end_reason = "timeout"
+
+                if end_reason:
+                    print(f"  event ended ({end_reason})  {len(event_samples)} samples")
+                    # Sanity check: require at least MIN_EVENT_SAMPLES clearly off-baseline
+                    off_baseline = sum(1 for _, d, _ in event_samples
+                                       if 0 < d < 45000 and abs(d - bg_mean) > MIN_EVENT_EXCURSION)
+                    if off_baseline < MIN_EVENT_SAMPLES:
+                        print(f"  rejected: only {off_baseline} off-baseline samples "
+                              f"(need {MIN_EVENT_SAMPLES}) — likely noise/raindrop")
+                        in_event = False
+                        below_count = 0
+                        pre_buf.clear()
+                        continue
+                    result = analyze_event(event_samples, bg_mean)
+                    with _web_lock:
+                        rec = _recording_enabled
+                    if rec:
+                        save_event(event_start_epoch, event_samples, result)
+                    else:
+                        print(f"  recording disabled — event not saved")
+                    # Compute strength stats over valid (non-sentinel) dist samples
+                    strengths = [s[2] for s in event_samples if 0 < s[1] < 45000]
+                    str_avg = round(sum(strengths) / len(strengths), 1) if strengths else 0
+                    str_rms = round((sum(x*x for x in strengths) / len(strengths)) ** 0.5, 1) if strengths else 0
+                    log_entry = {
+                        "epoch":      event_start_epoch,
+                        "category":   result['category']        if result else '',
+                        "range_mm":   result['object_range_mm'] if result else 0,
+                        "range_rms":  result['range_rms_mm']    if result else 0,
+                        "duration_ms":result['duration_ms']     if result else 0,
+                        "str_avg":    str_avg,
+                        "str_rms":    str_rms,
+                    }
+                    with _web_lock:
+                        _web_state['category'] = result['category'] if result else ''
+                        _web_state['last_event_id'] = event_start_epoch
+                        _last_event[0] = {
+                            "id":             event_start_epoch,
+                            "category":       result['category']        if result else '',
+                            "object_range_mm":result['object_range_mm'] if result else 0,
+                            "duration_ms":    result['duration_ms']     if result else 0,
+                            "dur_start_ms":   result['dur_start_ms']    if result else 0,
+                            "bg_mean":        bg_mean,
+                            "trigger_ms":     trigger_ms,
+                            "valid_indices":  result['valid_indices']   if result else [],
+                            # Full 100-sps samples: [sample_num, dist_mm, strength]
+                            "samples":        [[s[0], s[1], s[2]] for s in event_samples],
+                        }
+                        _recent_events.append(_last_event[0])
+                        if rec:
+                            _event_log.append(log_entry)
+                            _event_epochs.append(event_start_epoch)
+                    in_event = False
+                    below_count = 0
+                    pre_buf.clear()
+
+# ---------------------------------------------------------------------------
+# Start sensor loop in its own thread; Flask takes the main thread.
+# ---------------------------------------------------------------------------
+threading.Thread(target=_sensor_loop, daemon=True, name='sensor').start()
+_start_web_server()  # blocks main thread
