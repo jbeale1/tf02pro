@@ -2,7 +2,9 @@
 
 # TF02-Pro LIDAR event logger
 # Detects objects crossing the beam and saves per-event CSVs.
-# J.Beale  5-Jun-2026
+# J.Beale  10-Jun-2026
+
+# IMX296 (global shutter cam): 5.02 mm sensor @ 320 pixels => 63.75 px/mm
 
 import serial
 import numpy as np
@@ -12,6 +14,7 @@ import datetime as _dt
 import pytz
 import collections
 import os
+import socket
 import threading
 import json
 import serial.tools.list_ports   # enable port scan for correct device
@@ -19,8 +22,39 @@ from flask import Flask, Response, render_template_string
 
 
 # --- Configuration ---
-VERSION = "1.050 2026-06-10"  # sample index for CSV, adjust event threshold, version in CSV
+VERSION = "1.052 2026-06-11"  # connected to camera machine via UDP
 OUTPUT_DIR    = 'events'
+
+# Camera notify: send LiDAR event summary to vehicle_detect.py on the camera machine.
+# Set CAMERA_HOST = None to disable.
+CAMERA_HOST        = "192.168.1.164"   # rp64.local
+CAMERA_PORT        = 5006              # UDP port vehicle_detect.py listens on
+CAMERA_RETRANSMITS = 2                 # extra copies to send (total = 1 + this)
+CAMERA_RETX_DELAY  = 0.20             # seconds between retransmissions
+
+_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def _notify_camera(epoch: float, duration_ms: int, dist_m: float):
+    """Send LiDAR event data to camera machine.
+    Retransmits CAMERA_RETRANSMITS extra times at CAMERA_RETX_DELAY intervals
+    to survive occasional WiFi packet loss.  Runs in a daemon thread so the
+    sensor loop is not blocked by the delays."""
+    if CAMERA_HOST is None:
+        return
+    payload = json.dumps({
+        "t":   round(epoch, 3),
+        "dur": duration_ms,
+        "d":   round(dist_m, 3),
+    }).encode()
+    def _send():
+        for i in range(1 + CAMERA_RETRANSMITS):
+            try:
+                _udp_sock.sendto(payload, (CAMERA_HOST, CAMERA_PORT))
+            except Exception as e:
+                print(f"[udp] send error (attempt {i+1}): {e}")
+            if i < CAMERA_RETRANSMITS:
+                time.sleep(CAMERA_RETX_DELAY)
+    threading.Thread(target=_send, daemon=True, name="udp_notify").start()
 
 WEB_PORT      = 8080         # LAN web interface port
 WEB_HZ        = 2            # SSE update rate for browser clients
@@ -46,7 +80,7 @@ EMA_ALPHA     = 0.001        # EMA coefficient for slow baseline drift (~1000-sa
 # at 10%–90% of max excursion.  Pedestrians ~0.7–0.8; vehicles ~0.05.
 RISE_TIME_THRESHOLD = 0.35  # >= this → pedestrian, < this → vehicle
 DROPOUT_VALUES = {0, 45000} # mm: 0=overload, 45000=loss-of-signal
-STABLE_RATE_THRESHOLD = 100 # mm/sample: max backward diff for a point to be "stable"
+STABLE_RATE_THRESHOLD = 200 # mm/sample: max backward diff for a point to be "stable"
 
 def find_ch341_port():
     """Return the serial port path for the first CH341 USB-serial adapter found."""
@@ -1362,6 +1396,12 @@ def _sensor_loop():
                         pre_buf.clear()
                         continue
                     result = analyze_event(event_samples, bg_mean)
+                    if result:
+                        _notify_camera(
+                            event_start_epoch,
+                            result['duration_ms'],
+                            result['object_range_mm'] / 1000.0,
+                        )
                     with _web_lock:
                         rec = _recording_enabled
                     if rec:
