@@ -222,13 +222,18 @@ def _probe_tf02_port(port, read_timeout=1.0, required_valid_frames=3):
     checksum) -- this is what distinguishes it from the *other* identically
     VID:PID'd (1a86:7523) CH341 adapter on this machine, which connects to
     a DFRobot SEN0648 running a completely different protocol/baud rate.
+    Opened with exclusive=True -- matching the real, long-lived open this
+    script uses -- so a port already held open elsewhere (most likely the
+    SEN0648's own reader script) is correctly detected as busy here rather
+    than only failing later on the real open; a plain, non-exclusive probe
+    open would falsely succeed against another process's exclusive lock,
+    since flock() only conflicts with another flock() request.
     Returns True once `required_valid_frames` valid frames are seen within
-    `read_timeout` seconds; False if the port can't even be opened (e.g.
-    it's already held open by another process -- most likely that other
-    sensor's own reader script) or never produces a valid frame in time.
+    `read_timeout` seconds; False if the port can't even be opened (busy)
+    or never produces a valid frame in time.
     """
     try:
-        probe = serial.Serial(port, 115200, timeout=0.2)
+        probe = serial.Serial(port, 115200, timeout=0.2, exclusive=True)
     except (serial.SerialException, OSError):
         return False  # busy or otherwise unavailable -- not our port right now
 
@@ -1338,7 +1343,7 @@ print(f"Web interface will start on http://0.0.0.0:{WEB_PORT}/  (LAN accessible)
 PORT = find_tf02_port()  # protocol-probe based auto-detect (see find_tf02_port)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-ser = serial.Serial(PORT, 115200, timeout=0.1)
+ser = serial.Serial(PORT, 115200, timeout=0.1, exclusive=True)
 
 # Switch TF02-Pro to mm output mode (command: 5A 05 05 06 6A)
 ser.write(bytes([0x5A, 0x05, 0x05, 0x06, 0x6A]))
